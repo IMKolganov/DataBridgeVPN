@@ -3,7 +3,7 @@ using System.IO;
 using System.Net.Sockets;
 
 const string TapctlPath = "tapctl.exe";
-const string TapDeviceName = "My TAP Device";
+const string TapDeviceName = "Data Bridge VPN TAP Device";
 const string VpnServerAddress = "192.168.1.1";
 const int VpnServerPort = 51820;
 
@@ -15,21 +15,17 @@ if (!File.Exists(TapctlPath))
     return;
 }
 
-if (!TapDeviceExists())
-{
-    Console.WriteLine("TAP-устройство не найдено. Создаю новое устройство...");
-    if (!CreateTapDevice())
-    {
-        Console.WriteLine("Не удалось создать TAP-устройство. Завершение работы.");
-        return;
-    }
-}
-
 string tapGuid = GetTapGuid();
 if (string.IsNullOrEmpty(tapGuid))
 {
-    Console.WriteLine("Не удалось получить GUID TAP-устройства. Завершение работы.");
-    return;
+    Console.WriteLine("TAP-устройство не найдено. Создаю новое устройство...");
+    if (!CreateTapDevice(out string creationOutput))
+    {
+        Console.WriteLine($"Ошибка создания TAP-устройства: {creationOutput}");
+        Console.WriteLine("Не удалось создать TAP-устройство. Завершение работы.");
+        return;
+    }
+    tapGuid = creationOutput;
 }
 
 Console.WriteLine("TAP-устройство успешно настроено.");
@@ -43,14 +39,14 @@ static bool TapDeviceExists()
     return output.Contains(TapDeviceName);
 }
 
-static bool CreateTapDevice()
+static bool CreateTapDevice(out string output)
 {
-    string output = ExecuteTapctlCommand($"create \"{TapDeviceName}\"");
-    if (output.Contains("failed") || !output.Contains(TapDeviceName))
+    output = ExecuteTapctlCommand($"create --name \"{TapDeviceName}\"");
+    if (output.Contains("failed") || !output.Contains("{"))
     {
-        Console.WriteLine($"Ошибка создания TAP-устройства: {output}");
         return false;
     }
+    output = output.Split('{', '}')[1]; // Extract GUID
     return true;
 }
 
@@ -63,8 +59,12 @@ static string GetTapGuid()
     {
         if (line.Contains(TapDeviceName))
         {
-            string[] parts = line.Split(' ');
-            return parts[0].Trim('{', '}');
+            int guidStart = line.IndexOf('{');
+            int guidEnd = line.IndexOf('}');
+            if (guidStart >= 0 && guidEnd > guidStart)
+            {
+                return line.Substring(guidStart + 1, guidEnd - guidStart - 1);
+            }
         }
     }
 
@@ -98,6 +98,18 @@ static async Task ProcessTapTrafficAsync(string tapGuid)
                 Console.WriteLine("Данные отправлены на сервер VPN.");
             }
         }
+    }
+    catch (OperationCanceledException)
+    {
+        Console.WriteLine("Ошибка обработки трафика: операция была отменена.");
+    }
+    catch (IOException ex)
+    {
+        Console.WriteLine($"Ошибка обработки трафика: проблема с TAP-устройством. {ex.Message}");
+    }
+    catch (SocketException ex)
+    {
+        Console.WriteLine($"Ошибка обработки трафика: проблема с подключением к серверу VPN. {ex.Message}");
     }
     catch (Exception ex)
     {
