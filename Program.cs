@@ -1,6 +1,8 @@
 ﻿using System.Diagnostics;
 using System.IO;
 using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
 
 const string TapctlPath = "tapctl.exe";
 const string TapDeviceName = "Data Bridge VPN TAP Device";
@@ -31,7 +33,15 @@ if (string.IsNullOrEmpty(tapGuid))
 Console.WriteLine("TAP-устройство успешно настроено.");
 Console.WriteLine("Начинаю обработку трафика...");
 
-await ProcessTapTrafficAsync(tapGuid);
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (sender, e) =>
+{
+    e.Cancel = true;
+    cts.Cancel();
+    Console.WriteLine("Отмена операции пользователем...");
+};
+
+await ProcessTapTrafficAsync(tapGuid, cts.Token);
 
 static bool TapDeviceExists()
 {
@@ -46,7 +56,7 @@ static bool CreateTapDevice(out string output)
     {
         return false;
     }
-    output = output.Split('{', '}')[1]; // Extract GUID
+    output = output.Split(new[] { '{', '}' }, StringSplitOptions.RemoveEmptyEntries)[0].Trim();
     return true;
 }
 
@@ -70,52 +80,39 @@ static string GetTapGuid()
 
     return null;
 }
-
-static async Task ProcessTapTrafficAsync(string tapGuid)
+static async Task ProcessTapTrafficAsync(string tapGuid, CancellationToken cancellationToken)
 {
     string tapDevicePath = $"\\\\.\\Global\\{{{tapGuid}}}.tap";
-    const int BufferSize = 1500;
-
-    byte[] buffer = new byte[BufferSize];
+    Console.WriteLine($"Попытка открыть TAP-устройство по пути: {tapDevicePath}");
 
     try
     {
         using var fileStream = new FileStream(tapDevicePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
-        using var udpClient = new UdpClient();
-        udpClient.Connect(VpnServerAddress, VpnServerPort);
-
         Console.WriteLine("Обработка трафика TAP началась...");
+        
+        const int BufferSize = 1500;
+        byte[] buffer = new byte[BufferSize];
 
-        while (true)
+        while (!cancellationToken.IsCancellationRequested)
         {
-            int bytesRead = await fileStream.ReadAsync(buffer, 0, BufferSize);
-            if (bytesRead > 0)
-            {
-                Console.WriteLine($"Принято {bytesRead} байт из TAP.");
-
-                // Отправка данных на сервер
-                await udpClient.SendAsync(buffer, bytesRead);
-                Console.WriteLine("Данные отправлены на сервер VPN.");
-            }
+            int bytesRead = await fileStream.ReadAsync(buffer, 0, BufferSize, cancellationToken);
+            Console.WriteLine($"Прочитано {bytesRead} байт из TAP-устройства.");
         }
     }
-    catch (OperationCanceledException)
+    catch (FileNotFoundException)
     {
-        Console.WriteLine("Ошибка обработки трафика: операция была отменена.");
+        Console.WriteLine($"TAP-устройство не найдено по пути: {tapDevicePath}. Проверьте, что устройство создано.");
     }
-    catch (IOException ex)
+    catch (UnauthorizedAccessException)
     {
-        Console.WriteLine($"Ошибка обработки трафика: проблема с TAP-устройством. {ex.Message}");
-    }
-    catch (SocketException ex)
-    {
-        Console.WriteLine($"Ошибка обработки трафика: проблема с подключением к серверу VPN. {ex.Message}");
+        Console.WriteLine($"Нет прав для доступа к TAP-устройству. Запустите приложение от имени администратора.");
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"Ошибка обработки трафика: {ex.Message}");
+        Console.WriteLine($"Ошибка обработки трафика TAP: {ex.Message}");
     }
 }
+
 
 static string ExecuteTapctlCommand(string arguments)
 {
