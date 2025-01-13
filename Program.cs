@@ -1,180 +1,100 @@
-﻿using System;
-using System.Buffers;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.IO;
-using System.Management;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
-using Microsoft.Win32;
 
-const int BUFFER_SIZE = 1500; // Размер Ethernet-фрейма
+const string TapctlPath = "tapctl.exe";
+const string TapDeviceName = "My TAP Device";
+const string VpnServerAddress = "192.168.1.1";
+const int VpnServerPort = 51820;
 
 Console.WriteLine("Запуск VPN-клиента...");
 
-string devconPath = GetDevconPath();
-if (devconPath == null)
+if (!File.Exists(TapctlPath))
 {
-    Console.WriteLine("Не найден инструмент devcon.exe. Завершение работы.");
+    Console.WriteLine("Ошибка: tapctl.exe не найден рядом с приложением.");
     return;
 }
 
-Console.WriteLine($"Путь к devcon.exe: {devconPath}");
-
-if (!IsTapDriverInstalled())
+if (!TapDeviceExists())
 {
-    Console.WriteLine("TAP-драйвер не установлен. Попытка установить...");
-    InstallTapDriver();
-    if (!IsTapDriverInstalled())
+    Console.WriteLine("TAP-устройство не найдено. Создаю новое устройство...");
+    if (!CreateTapDevice())
     {
-        Console.WriteLine("Не удалось установить TAP-драйвер. Завершение работы.");
+        Console.WriteLine("Не удалось создать TAP-устройство. Завершение работы.");
         return;
     }
-    else
-    {
-        Console.WriteLine("TAP-драйвер успешно установлен.");
-    }
 }
 
-string tapDevicePath = GetTapDevicePath();
-if (tapDevicePath == null)
+string tapGuid = GetTapGuid();
+if (string.IsNullOrEmpty(tapGuid))
 {
-    Console.WriteLine("Не удалось найти TAP-устройство.");
+    Console.WriteLine("Не удалось получить GUID TAP-устройства. Завершение работы.");
     return;
 }
 
-Console.WriteLine($"TAP-устройство найдено: {tapDevicePath}");
+Console.WriteLine("TAP-устройство успешно настроено.");
+Console.WriteLine("Начинаю обработку трафика...");
 
-var tapHandle = OpenTapDevice(tapDevicePath);
-if (tapHandle == IntPtr.Zero)
+await ProcessTapTrafficAsync(tapGuid);
+
+static bool TapDeviceExists()
 {
-    Console.WriteLine("Не удалось открыть TAP-устройство.");
-    return;
+    string output = ExecuteTapctlCommand("list");
+    return output.Contains(TapDeviceName);
 }
 
-Console.WriteLine("TAP-устройство успешно открыто.");
-
-// Запуск обработки трафика
-await ProcessTapTrafficAsync(tapHandle);
-
-Console.WriteLine("Завершение работы VPN-клиента.");
-
-static bool IsTapDriverInstalled()
+static bool CreateTapDevice()
 {
-    var process = new Process
+    string output = ExecuteTapctlCommand($"create \"{TapDeviceName}\"");
+    if (output.Contains("failed") || !output.Contains(TapDeviceName))
     {
-        StartInfo = new ProcessStartInfo
-        {
-            FileName = "devcon.exe",
-            Arguments = "find tap0901",
-            RedirectStandardOutput = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        }
-    };
-
-    process.Start();
-    string output = process.StandardOutput.ReadToEnd();
-    process.WaitForExit();
-
-    return output.Contains("TAP-Windows Adapter V9"); // Проверяем по имени адаптера
-}
-
-static void InstallTapDriver()
-{
-    var process = new Process
-    {
-        StartInfo = new ProcessStartInfo
-        {
-            FileName = "cmd.exe",
-            Arguments = "/c addtap.bat",
-            WorkingDirectory = @"C:\Program Files\TAP-Windows\bin",
-            UseShellExecute = true,
-            Verb = "runas" // Запуск от имени администратора
-        }
-    };
-
-    process.Start();
-    process.WaitForExit();
-
-    if (process.ExitCode == 0)
-    {
-        Console.WriteLine("TAP-драйвер успешно установлен.");
+        Console.WriteLine($"Ошибка создания TAP-устройства: {output}");
+        return false;
     }
-    else
-    {
-        Console.WriteLine($"Ошибка установки TAP-драйвера. Код: {process.ExitCode}");
-    }
+    return true;
 }
 
-static string GetTapDevicePath()
+static string GetTapGuid()
 {
-    string query = "SELECT * FROM Win32_NetworkAdapter WHERE Name LIKE '%TAP-Windows Adapter V9%'";
-    using (var searcher = new ManagementObjectSearcher(query))
+    string output = ExecuteTapctlCommand("list");
+    string[] lines = output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+
+    foreach (string line in lines)
     {
-        foreach (ManagementObject obj in searcher.Get())
+        if (line.Contains(TapDeviceName))
         {
-            string pnpDeviceId = obj["PNPDeviceID"]?.ToString();
-            if (pnpDeviceId != null)
-            {
-                // PNPDeviceID имеет формат "ROOT\\TAP0901\\{GUID}"
-                int startIndex = pnpDeviceId.IndexOf('{');
-                int endIndex = pnpDeviceId.IndexOf('}');
-                if (startIndex != -1 && endIndex != -1)
-                {
-                    string guid = pnpDeviceId.Substring(startIndex, endIndex - startIndex + 1);
-                    return $"\\\\.\\Global\\{guid}.tap"; // Формируем путь к устройству
-                }
-            }
+            string[] parts = line.Split(' ');
+            return parts[0].Trim('{', '}');
         }
     }
-    return null; // Устройство не найдено
+
+    return null;
 }
 
-static IntPtr OpenTapDevice(string tapDevicePath)
+static async Task ProcessTapTrafficAsync(string tapGuid)
 {
-    const uint GENERIC_READ_WRITE = 0xC0000000;
-    const uint OPEN_EXISTING = 3;
+    string tapDevicePath = $"\\\\.\\Global\\{{{tapGuid}}}.tap";
+    const int BufferSize = 1500;
 
-    IntPtr handle = CreateFile(
-        tapDevicePath,
-        GENERIC_READ_WRITE,
-        0,
-        IntPtr.Zero,
-        OPEN_EXISTING,
-        0,
-        IntPtr.Zero
-    );
-
-    if (handle == IntPtr.Zero)
-    {
-        int errorCode = Marshal.GetLastWin32Error();
-        Console.WriteLine($"Не удалось открыть TAP-устройство. Код ошибки: {errorCode}");
-    }
-
-    return handle;
-}
-
-static async Task ProcessTapTrafficAsync(IntPtr tapHandle)
-{
-    byte[] buffer = ArrayPool<byte>.Shared.Rent(BUFFER_SIZE);
+    byte[] buffer = new byte[BufferSize];
 
     try
     {
-        using var stream = new FileStream(new Microsoft.Win32.SafeHandles.SafeFileHandle(tapHandle, false), FileAccess.ReadWrite, BUFFER_SIZE, isAsync: true);
+        using var fileStream = new FileStream(tapDevicePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
         using var udpClient = new UdpClient();
-        udpClient.Connect("192.168.1.1", 51820); // Укажите адрес и порт вашего VPN-сервера
+        udpClient.Connect(VpnServerAddress, VpnServerPort);
 
         Console.WriteLine("Обработка трафика TAP началась...");
 
         while (true)
         {
-            int bytesRead = await stream.ReadAsync(buffer.AsMemory(0, BUFFER_SIZE));
+            int bytesRead = await fileStream.ReadAsync(buffer, 0, BufferSize);
             if (bytesRead > 0)
             {
                 Console.WriteLine($"Принято {bytesRead} байт из TAP.");
 
-                // Отправка данных на VPN-сервер
-                await udpClient.SendAsync(buffer.AsMemory(0, bytesRead));
+                // Отправка данных на сервер
+                await udpClient.SendAsync(buffer, bytesRead);
                 Console.WriteLine("Данные отправлены на сервер VPN.");
             }
         }
@@ -183,76 +103,34 @@ static async Task ProcessTapTrafficAsync(IntPtr tapHandle)
     {
         Console.WriteLine($"Ошибка обработки трафика: {ex.Message}");
     }
-    finally
-    {
-        ArrayPool<byte>.Shared.Return(buffer);
-    }
 }
 
-static string GetTapToolsPath()
+static string ExecuteTapctlCommand(string arguments)
 {
-    const string registryKey = @"SOFTWARE\OpenVPN";
-    const string valueName = "InstallDir";
-
-    using var key = Registry.LocalMachine.OpenSubKey(registryKey);
-    if (key != null)
+    try
     {
-        string installPath = key.GetValue(valueName) as string;
-        if (!string.IsNullOrEmpty(installPath))
+        var process = new Process
         {
-            string devconPath = Path.Combine(installPath, "bin", "devcon.exe");
-            if (File.Exists(devconPath))
+            StartInfo = new ProcessStartInfo
             {
-                return devconPath;
+                FileName = TapctlPath,
+                Arguments = arguments,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
             }
-        }
+        };
+
+        process.Start();
+        string output = process.StandardOutput.ReadToEnd();
+        process.WaitForExit();
+
+        return output;
     }
-
-    return null; // devcon.exe не найден
-}
-
-static string GetDevconPath()
-{
-    // Массив возможных имён ключей в реестре
-    string[] valueNames = { "InstallDir", "bin_dir" };
-    const string registryKey = @"SOFTWARE\OpenVPN";
-
-    // 1. Поиск рядом с приложением
-    string localDevconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "devcon.exe");
-    if (File.Exists(localDevconPath))
+    catch (Exception ex)
     {
-        return localDevconPath;
+        Console.WriteLine($"Ошибка выполнения команды tapctl: {ex.Message}");
+        return string.Empty;
     }
-
-    // 2. Поиск в реестре
-    using var key = Registry.LocalMachine.OpenSubKey(registryKey);
-    if (key != null)
-    {
-        foreach (var valueName in valueNames)
-        {
-            string installPath = key.GetValue(valueName) as string;
-            if (!string.IsNullOrEmpty(installPath))
-            {
-                string devconPath = Path.Combine(installPath, "bin", "devcon.exe");
-                if (File.Exists(devconPath))
-                {
-                    return devconPath;
-                }
-            }
-        }
-    }
-
-    Console.WriteLine("Не удалось найти devcon.exe. Убедитесь, что TAP-драйвер установлен.");
-    return null;
 }
-
-[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-static extern IntPtr CreateFile(
-    string lpFileName,
-    uint dwDesiredAccess,
-    uint dwShareMode,
-    IntPtr lpSecurityAttributes,
-    uint dwCreationDisposition,
-    uint dwFlagsAndAttributes,
-    IntPtr hTemplateFile
-);
